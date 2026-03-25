@@ -1,0 +1,65 @@
+# ----------------------
+# Python
+# ----------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.env.*
+
+# ----------------------
+# Streamlit
+# ----------------------
+.streamlit/
+
+# ----------------------
+# Logs
+# ----------------------
+*.log
+
+# ----------------------
+# OS files
+# ----------------------
+.DS_Store
+Thumbs.db
+
+# ----------------------
+# IDE / Editors
+# ----------------------
+.vscode/
+.idea/
+
+# ----------------------
+# Temp download files (IMPORTANT for your project)
+# ----------------------
+temp/
+*.part
+
+# ----------------------
+# Build / Distribution
+# ----------------------
+build/
+dist/
+*.egg-info/
+
+# ----------------------
+# SQLite / Database
+# ----------------------
+*.db
+*.sqlite3
+
+# ----------------------
+# Testing / Coverage
+# ----------------------
+.coverage
+htmlcov/
+.pytest_cache/
+
+# ----------------------
+# Misc
+# ----------------------
+*.swp
+*.bak
