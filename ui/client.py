@@ -1,12 +1,17 @@
+# https://proof.ovh.net/files/100Mb.dat
 import sys
 import threading
+import time
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
+import streamlit.web.cli as streamlit_cli
+from streamlit.runtime.scriptrunner import get_script_run_ctx
 
 from config import (
     APP_NAME,
@@ -21,9 +26,29 @@ from config import (
     ensure_directories,
 )
 from core.downloader import DownloadManager
+from core.models import DownloadStatus
 from core.persistence import PersistenceManager
 
 
+PROGRESS_REFRESH_INTERVAL_SECONDS = 0.5
+
+
+def relaunch_with_streamlit_if_needed() -> None:
+    """
+    Streamlit apps need Streamlit's script runner for session state and UI updates.
+    If this file is launched with `python ui/client.py`, hand off to `streamlit run`.
+    """
+    if __name__ == "__main__" and get_script_run_ctx(suppress_warning=True) is None:
+        sys.argv = [
+            "streamlit",
+            "run",
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+        ]
+        raise SystemExit(streamlit_cli.main())
+
+
+relaunch_with_streamlit_if_needed()
 ensure_directories()
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
@@ -59,12 +84,50 @@ if "ui_state" not in st.session_state:
         "speed": "0 KB/s",
         "eta": "--",
         "error": None,
+        "done": False,
+        "task_id": None,
+        "download_status": "idle",
     }
+
+if "ui_state_lock" not in st.session_state:
+    st.session_state.ui_state_lock = threading.Lock()
 
 
 # -----------------------------
 # Helpers
 # -----------------------------
+def update_ui_state(
+    ui_state: dict[str, Any],
+    ui_state_lock: threading.Lock,
+    **updates: Any,
+) -> None:
+    with ui_state_lock:
+        ui_state.update(updates)
+
+
+def get_ui_state_snapshot() -> dict[str, Any]:
+    with st.session_state.ui_state_lock:
+        return dict(st.session_state.ui_state)
+
+
+def sync_download_state(ui_state: dict[str, Any]) -> None:
+    thread = st.session_state.download_thread
+
+    if thread is not None and not thread.is_alive():
+        st.session_state.is_downloading = False
+    if ui_state.get("task_id"):
+        st.session_state.current_task_id = ui_state["task_id"]
+
+
+def save_task_state(manager: DownloadManager, task_id: str | None) -> None:
+    if not task_id:
+        return
+
+    task = manager.get_status(task_id)
+    persistence = PersistenceManager(db_path=str(DB_PATH))
+    persistence.save_download_task(task)
+
+
 def resolve_output_path(output_name: str) -> str:
     output_name = output_name.strip()
     path = Path(output_name)
@@ -82,22 +145,61 @@ def run_download(
     thread_count: int,
     max_retries: int,
     ui_state: dict,
+    ui_state_lock: threading.Lock,
 ) -> None:
     """
     Background thread function.
     IMPORTANT: do not use st.* or st.session_state here.
     """
     try:
-        ui_state["status_message"] = "Downloading..."
-        ui_state["progress"] = 0.0
-        ui_state["speed"] = "0 KB/s"
-        ui_state["eta"] = "--"
-        ui_state["error"] = None
+        persistence = PersistenceManager(db_path=str(DB_PATH))
+        task_id_holder: dict[str, str | None] = {"task_id": None}
+        last_save_at = {"value": 0.0}
+
+        def save_active_task(force: bool = False) -> None:
+            task_id = task_id_holder["task_id"]
+            if not task_id:
+                return
+
+            now = time.time()
+            if not force and now - last_save_at["value"] < 1.0:
+                return
+
+            persistence.save_download_task(manager.get_status(task_id))
+            last_save_at["value"] = now
+
+        def task_created_callback(task) -> None:
+            task_id_holder["task_id"] = task.task_id
+            update_ui_state(
+                ui_state,
+                ui_state_lock,
+                task_id=task.task_id,
+                download_status=task.status.value,
+                status_message="Downloading...",
+            )
+            persistence.save_download_task(task)
+
+        update_ui_state(
+            ui_state,
+            ui_state_lock,
+            status_message="Downloading...",
+            progress=0.0,
+            speed="0 KB/s",
+            eta="--",
+            error=None,
+            done=False,
+            download_status=DownloadStatus.DOWNLOADING.value,
+        )
 
         def progress_callback(progress_value: float, speed_text: str, eta_text: str) -> None:
-            ui_state["progress"] = progress_value
-            ui_state["speed"] = speed_text
-            ui_state["eta"] = eta_text
+            update_ui_state(
+                ui_state,
+                ui_state_lock,
+                progress=progress_value,
+                speed=speed_text,
+                eta=eta_text,
+            )
+            save_active_task()
 
         task_id = manager.start_download(
             url=url,
@@ -105,24 +207,108 @@ def run_download(
             thread_count=thread_count,
             max_retries=max_retries,
             progress_callback=progress_callback,
+            task_created_callback=task_created_callback,
+        )
+        task_id_holder["task_id"] = task_id
+        task = manager.get_status(task_id)
+
+        update_ui_state(
+            ui_state,
+            ui_state_lock,
+            status_message=f"Download {task.status.value}: {task_id}",
+            progress=task.progress_percentage() / 100,
+            speed="0 KB/s" if task.status == DownloadStatus.COMPLETED else "0 KB/s",
+            eta="00:00:00" if task.status == DownloadStatus.COMPLETED else "--",
+            task_id=task_id,
+            download_status=task.status.value,
         )
 
-        ui_state["status_message"] = f"Download completed: {task_id}"
-        ui_state["progress"] = 1.0
-        ui_state["speed"] = "0 KB/s"
-        ui_state["eta"] = "00:00:00"
-        ui_state["task_id"] = task_id
-
-        task = manager.get_status(task_id)
-        persistence = PersistenceManager(db_path=str(DB_PATH))
-        persistence.save_download_task(task)
+        save_active_task(force=True)
 
     except Exception as e:
-        ui_state["status_message"] = "Download failed."
-        ui_state["error"] = str(e)
+        update_ui_state(
+            ui_state,
+            ui_state_lock,
+            status_message="Download failed.",
+            error=str(e),
+            download_status=DownloadStatus.FAILED.value,
+        )
 
     finally:
-        ui_state["done"] = True
+        update_ui_state(ui_state, ui_state_lock, done=True)
+
+
+def run_resume(
+    manager: DownloadManager,
+    task_id: str,
+    max_retries: int,
+    ui_state: dict,
+    ui_state_lock: threading.Lock,
+) -> None:
+    """
+    Background resume function.
+    IMPORTANT: do not use st.* or st.session_state here.
+    """
+    persistence = PersistenceManager(db_path=str(DB_PATH))
+    last_save_at = {"value": 0.0}
+
+    def save_active_task(force: bool = False) -> None:
+        now = time.time()
+        if not force and now - last_save_at["value"] < 1.0:
+            return
+
+        persistence.save_download_task(manager.get_status(task_id))
+        last_save_at["value"] = now
+
+    try:
+        update_ui_state(
+            ui_state,
+            ui_state_lock,
+            status_message="Resuming download...",
+            error=None,
+            done=False,
+            download_status=DownloadStatus.DOWNLOADING.value,
+        )
+
+        def progress_callback(progress_value: float, speed_text: str, eta_text: str) -> None:
+            update_ui_state(
+                ui_state,
+                ui_state_lock,
+                progress=progress_value,
+                speed=speed_text,
+                eta=eta_text,
+            )
+            save_active_task()
+
+        manager.resume_download(
+            task_id=task_id,
+            progress_callback=progress_callback,
+            max_retries=max_retries,
+        )
+
+        task = manager.get_status(task_id)
+        update_ui_state(
+            ui_state,
+            ui_state_lock,
+            status_message=f"Download {task.status.value}: {task_id}",
+            progress=task.progress_percentage() / 100,
+            speed="0 KB/s",
+            eta="00:00:00" if task.status == DownloadStatus.COMPLETED else "--",
+            download_status=task.status.value,
+        )
+        save_active_task(force=True)
+
+    except Exception as e:
+        update_ui_state(
+            ui_state,
+            ui_state_lock,
+            status_message="Resume failed.",
+            error=str(e),
+            download_status=DownloadStatus.FAILED.value,
+        )
+
+    finally:
+        update_ui_state(ui_state, ui_state_lock, done=True)
 
 
 # -----------------------------
@@ -151,7 +337,7 @@ max_retries = st.sidebar.number_input(
 url = st.text_input("File URL", placeholder="https://proof.ovh.net/files/100Mb.dat")
 output_name = st.text_input("Output filename", placeholder="example.bin")
 
-col1, col2, col3 = st.columns(3)
+col1, col2 = st.columns(2)
 
 with col1:
     if st.button("Start Download", width="stretch"):
@@ -178,6 +364,7 @@ with col1:
                 "error": None,
                 "done": False,
                 "task_id": None,
+                "download_status": "preparing",
             }
 
             thread = threading.Thread(
@@ -189,6 +376,7 @@ with col1:
                     int(thread_count),
                     int(max_retries),
                     st.session_state.ui_state,
+                    st.session_state.ui_state_lock,
                 ),
                 daemon=True,
             )
@@ -198,10 +386,6 @@ with col1:
             st.rerun()
 
 with col2:
-    if st.button("Refresh Status", width="stretch"):
-        st.rerun()
-
-with col3:
     if st.button("Reset UI", width="stretch"):
         st.session_state.is_downloading = False
         st.session_state.download_thread = None
@@ -212,41 +396,115 @@ with col3:
             "speed": "0 KB/s",
             "eta": "--",
             "error": None,
+            "done": False,
+            "task_id": None,
+            "download_status": "idle",
         }
         st.rerun()
 
 
 # -----------------------------
-# Sync state from worker result
-# -----------------------------
-thread = st.session_state.download_thread
-ui_state = st.session_state.ui_state
-
-if thread is not None and not thread.is_alive():
-    st.session_state.is_downloading = False
-    if ui_state.get("task_id"):
-        st.session_state.current_task_id = ui_state["task_id"]
-
-
-# -----------------------------
 # Progress display
 # -----------------------------
-st.subheader("Progress")
+@st.fragment(run_every=PROGRESS_REFRESH_INTERVAL_SECONDS)
+def render_progress_panel() -> None:
+    ui_state = get_ui_state_snapshot()
+    sync_download_state(ui_state)
 
-st.progress(float(ui_state.get("progress", 0.0)))
+    st.subheader("Progress")
 
-st.write(f"**Status:** {ui_state.get('status_message', 'Idle')}")
-st.write(f"**Progress:** {ui_state.get('progress', 0.0) * 100:.1f}%")
-st.write(f"**Speed:** {ui_state.get('speed', '0 KB/s')}")
-st.write(f"**ETA:** {ui_state.get('eta', '--')}")
-st.write(f"**Temp folder:** `{TEMP_DIR}`")
-st.write(f"**Downloads folder:** `{DOWNLOADS_DIR}`")
+    progress = max(0.0, min(1.0, float(ui_state.get("progress", 0.0))))
+    st.progress(progress)
 
-if st.session_state.last_output_path:
-    st.write(f"**Target output:** `{st.session_state.last_output_path}`")
+    st.write(f"**Status:** {ui_state.get('status_message', 'Idle')}")
+    st.write(f"**Progress:** {progress * 100:.1f}%")
+    st.write(f"**Speed:** {ui_state.get('speed', '0 KB/s')}")
+    st.write(f"**ETA:** {ui_state.get('eta', '--')}")
+    st.write(f"**Temp folder:** `{TEMP_DIR}`")
+    st.write(f"**Downloads folder:** `{DOWNLOADS_DIR}`")
 
-if ui_state.get("error"):
-    st.error(ui_state["error"])
+    if st.session_state.last_output_path:
+        st.write(f"**Target output:** `{st.session_state.last_output_path}`")
+
+    if ui_state.get("error"):
+        st.error(ui_state["error"])
+
+    task_id = ui_state.get("task_id")
+    status = ui_state.get("download_status", "idle")
+    thread = st.session_state.download_thread
+    thread_is_alive = thread is not None and thread.is_alive()
+    can_pause = bool(task_id) and status == DownloadStatus.DOWNLOADING.value
+    can_resume = (
+        bool(task_id)
+        and status in (DownloadStatus.PAUSED.value, DownloadStatus.FAILED.value)
+        and not thread_is_alive
+    )
+    terminal_statuses = {
+        DownloadStatus.COMPLETED.value,
+        DownloadStatus.CANCELLED.value,
+        "idle",
+    }
+    can_cancel = bool(task_id) and status not in terminal_statuses
+
+    action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+
+    with action_col1:
+        if st.button("Pause", width="stretch", disabled=not can_pause):
+            try:
+                st.session_state.download_manager.pause_download(task_id)
+                save_task_state(st.session_state.download_manager, task_id)
+                update_ui_state(
+                    st.session_state.ui_state,
+                    st.session_state.ui_state_lock,
+                    status_message="Download paused.",
+                    download_status=DownloadStatus.PAUSED.value,
+                )
+            except Exception as e:
+                st.error(f"Pause failed: {e}")
+            st.rerun()
+
+    with action_col2:
+        if st.button("Resume", width="stretch", disabled=not can_resume):
+            thread = threading.Thread(
+                target=run_resume,
+                args=(
+                    st.session_state.download_manager,
+                    task_id,
+                    int(max_retries),
+                    st.session_state.ui_state,
+                    st.session_state.ui_state_lock,
+                ),
+                daemon=True,
+            )
+            st.session_state.download_thread = thread
+            st.session_state.is_downloading = True
+            thread.start()
+            st.rerun()
+
+    with action_col3:
+        if st.button("Cancel", width="stretch", disabled=not can_cancel):
+            try:
+                st.session_state.download_manager.cancel_download(task_id)
+                save_task_state(st.session_state.download_manager, task_id)
+                update_ui_state(
+                    st.session_state.ui_state,
+                    st.session_state.ui_state_lock,
+                    status_message="Download cancelled.",
+                    download_status=DownloadStatus.CANCELLED.value,
+                    speed="0 KB/s",
+                    eta="--",
+                    done=True,
+                )
+            except Exception as e:
+                st.error(f"Cancel failed: {e}")
+            st.rerun()
+
+    with action_col4:
+        if st.button("Refresh Status", width="stretch"):
+            st.rerun()
+
+
+render_progress_panel()
 
 
 # -----------------------------

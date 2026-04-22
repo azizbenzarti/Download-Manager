@@ -18,6 +18,7 @@ from core.segment_worker import SegmentWorker
 
 DownloadProgressCallback = Callable[[float, str, str], None]
 # receives: progress_fraction (0..1), speed_text, eta_text
+DownloadTaskCallback = Callable[[DownloadTask], None]
 
 
 class DownloadManager:
@@ -58,6 +59,7 @@ class DownloadManager:
         thread_count: int = 4,
         max_retries: int = 3,
         progress_callback: Optional[DownloadProgressCallback] = None,
+        task_created_callback: Optional[DownloadTaskCallback] = None,
     ) -> str:
         task_id = str(uuid.uuid4())
         metadata = self.http_client.get_file_metadata(url)
@@ -102,6 +104,9 @@ class DownloadManager:
         self.progress_locks[task_id] = threading.Lock()
         self.last_progress_callbacks[task_id] = progress_callback
 
+        if task_created_callback:
+            task_created_callback(task)
+
         self._run_download(task, max_retries, progress_callback)
         return task_id
 
@@ -109,6 +114,11 @@ class DownloadManager:
         task = self._get_task(task_id)
         self.pause_events[task_id].set()
         task.mark_paused()
+
+    def cancel_download(self, task_id: str) -> None:
+        task = self._get_task(task_id)
+        self.stop_events[task_id].set()
+        task.mark_cancelled()
 
     def resume_download(
         self,
@@ -194,6 +204,10 @@ class DownloadManager:
 
         for worker in workers:
             worker.join()
+
+        if self.stop_events[task.task_id].is_set():
+            task.mark_cancelled()
+            return
 
         if self.pause_events[task.task_id].is_set():
             task.mark_paused()

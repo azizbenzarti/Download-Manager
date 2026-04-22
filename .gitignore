@@ -63,3 +63,9 @@ htmlcov/
 # ----------------------
 *.swp
 *.bak
+
+.codex
+
+pat.txt
+
+downloads/

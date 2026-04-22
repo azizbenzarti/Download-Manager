@@ -53,10 +53,15 @@ class SegmentWorker(threading.Thread):
         while attempts <= self.max_retries:
             try:
                 if self.stop_event and self.stop_event.is_set():
-                    self.segment.status = SegmentStatus.PAUSED
+                    self.segment.status = SegmentStatus.CANCELLED
                     return
 
                 self._download_segment()
+                if self.segment.status in (
+                    SegmentStatus.PAUSED,
+                    SegmentStatus.CANCELLED,
+                ):
+                    return
                 self.segment.status = SegmentStatus.COMPLETED
                 self.segment.error_message = None
                 return
@@ -67,7 +72,7 @@ class SegmentWorker(threading.Thread):
                 self.segment.error_message = str(exc)
 
                 if self.stop_event and self.stop_event.is_set():
-                    self.segment.status = SegmentStatus.PAUSED
+                    self.segment.status = SegmentStatus.CANCELLED
                     return
 
                 if attempts > self.max_retries:
@@ -107,13 +112,12 @@ class SegmentWorker(threading.Thread):
                 chunk_size=self.chunk_size,
             ):
                 if self.stop_event and self.stop_event.is_set():
-                    self.segment.status = SegmentStatus.PAUSED
+                    self.segment.status = SegmentStatus.CANCELLED
                     return
 
-                while self.pause_event and self.pause_event.is_set():
+                if self.pause_event and self.pause_event.is_set():
                     self.segment.status = SegmentStatus.PAUSED
-                    if self.stop_event and self.stop_event.is_set():
-                        return
+                    return
 
                 temp_file.write(chunk)
                 temp_file.flush()
